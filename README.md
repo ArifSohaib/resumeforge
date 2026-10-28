@@ -24,15 +24,19 @@ User Conversation
         ↓
 LangGraph (state machine)
         ↓
-Extractor (LLM → structured data)
+Extractor (LLM → facts from the latest exchange only)
         ↓
-ResumeFacts (Pydantic schema)
+Deterministic merge into ResumeFacts (nothing already known is lost)
+        ↓                                   Job description (/job)
+        ↓                                           ↓
+        ↓                                 JobDescription (LLM extraction)
+        ↓                                           ↓
+        ├──────────────→  Match report (deterministic) + suitability assessment (LLM)
         ↓
-DuckDB (resume_vault.db)
+Writer: LLM rewrites bullets → Markdown → HTML → PDF → count pages
+        ↺ regenerate with a tighter budget while pages > 2, then trim if still needed
         ↓
-Parquet backup (resume_backup.parquet)
-        ↓
-Resume Generator (Markdown output)
+resume_draft.md / .html / .pdf  +  DuckDB (resume_vault.db) + Parquet backup
 ```
 
 ---
@@ -54,7 +58,8 @@ Resume Generator (Markdown output)
 * 📊 Structured data extraction (Pydantic schema)
 * 💾 Local-first storage (DuckDB + Parquet)
 * 🔁 Incremental updates via chat
-* 📄 Markdown resume generation
+* 📄 Markdown, HTML and PDF resume generation, guaranteed to fit in 2 pages
+* 🎯 Job description parsing, skill matching, suitability verdict and questions to confirm gaps
 * 🔍 Foundation for querying and filtering experience
 
 ---
@@ -68,12 +73,17 @@ resume-vault/
 ├── prompts/
 │   └── system_prompt.py   # System prompt for LLM behavior
 ├── nodes/
-│   └── nodes.py           # LangGraph nodes (chat, extractor, writer)
+│   ├── nodes.py           # LangGraph nodes (chat, extractor, job, match, writer) + persistence
+│   ├── merge.py           # Deterministic merge of newly extracted facts
+│   ├── matching.py        # Deterministic resume ↔ job matching
+│   └── render.py          # Markdown/HTML rendering and PDF page counting
+├── tests/                 # pytest suite (uses a fake LLM, no Ollama needed)
+├── config.py              # Model, context size, page limit and generation budgets
 ├── main.py                # Graph definition + CLI entry point
 ├── app.py                 # FastAPI chat UI
 ├── resume_vault.db        # DuckDB database (will be generated after interview)
 ├── resume_backup.parquet  # Parquet backup (will be generated after interview)
-├── resume_draft.md        # Generated resume
+├── resume_draft.md        # Generated resume (also .html and .pdf)
 ```
 
 ---
@@ -85,23 +95,31 @@ resume-vault/
 The system interacts with the user using a structured interview strategy:
 
 * asks one question at a time
-* focuses on missing or weak resume sections
+* is given an explicit list of gaps (missing dates, roles without achievements or tools, ...)
+* when a job description is loaded, asks about its requirements that the facts don't show yet
 
 ---
 
 ### 2. Extraction Layer
 
-The LLM converts conversation into structured data:
+After every answer the LLM extracts only what is new in that exchange (the AI question plus
+the user's answer), and the result is merged into the existing facts in Python. Facts already
+collected are never overwritten by a forgetful model, partial answers ("I started in March")
+are attached to the right role, and a failed extraction leaves the previous facts untouched.
 
 ```python
 class ResumeFacts(BaseModel):
     personal_details: PersonalDetails
     skills: List[str]
     education: List[Education]
-    profession: List[ProfessionalExperience]
+    profession: List[ProfessionalExperience]   # includes highlights and technologies per role
+    projects: List[Project]
     awards: List[Awards]
     other_details: List[OtherDetails]
 ```
+
+Ollama's context window is raised to 16k tokens (`RESUMEFORGE_NUM_CTX`) because the default
+silently drops the beginning of long conversations.
 
 ---
 
@@ -115,16 +133,38 @@ To check what is stored use:
 ```python
 import duckdb
 
-filepath = "resume_vault.parquet"
-saved_candidate_data = duckdb.query(f"select * from '{filepath}'").db()
-
+con = duckdb.connect("resume_vault.db")
+con.sql("select saved_at, facts_json from resume_facts order by saved_at desc").show()
+con.sql("select saved_at, job_title, company, score from job_matches").show()
 ```
 
 ---
 
 ### 4. Resume Generation
 
-Structured data is converted into an ATS-friendly Markdown resume.
+Structured data is converted into an ATS-friendly, single-column resume:
+
+1. The LLM writes a short summary and rewrites each role's highlights into a limited number of bullets
+   (more for recent roles, fewer for older ones), using only the facts collected.
+2. The resume is rendered to Markdown → HTML → PDF and the pages are counted.
+3. If it is longer than `MAX_PAGES` (2), it is regenerated with the next, tighter budget in
+   `config.GENERATION_BUDGETS` (fewer and shorter bullets, fewer projects).
+4. If every budget is still too long, content is trimmed deterministically: extra sections,
+   then projects, then bullets from the oldest roles, then the skill list.
+
+The PDF you download is the one that was measured, so it is guaranteed to fit.
+Markdown stays as the editable plain-text version; HTML is for preview/printing.
+
+### 5. Job description matching
+
+Paste a job posting (`/job` in the CLI, or the "Target job" box in the web UI):
+
+* the posting is parsed into a `JobDescription` (required/preferred skills, years of experience, education, ...)
+* skills are matched deterministically against your skills, role technologies and achievements
+  (with aliases such as k8s → Kubernetes) and a score out of 100 is computed
+* the LLM gives a verdict (strong / moderate / weak), strengths, gaps and questions to confirm
+* the interviewer then asks about the missing requirements; `/match` re-checks after you answer
+* `generate` tailors the resume to the job: relevant bullets and skills are ordered first
 
 ---
 
@@ -133,7 +173,13 @@ Structured data is converted into an ATS-friendly Markdown resume.
 ### 1. Install dependencies
 
 ```bash
-pip install -r requirements.txt
+uv sync
+```
+
+Run the tests (no Ollama needed):
+
+```bash
+uv run pytest
 ```
 
 ---
@@ -154,6 +200,9 @@ ollama run gemma4:e4b
 python main.py
 ```
 
+Commands: `generate` (or `done`), `/job <file or text>`, `/match`, `/facts`,
+`/import <conversation.txt>`, `/load` (last saved facts), `/help`, `/quit`.
+
 ---
 
 ### 4. Run web UI (UI needs more polish)
@@ -171,14 +220,17 @@ http://127.0.0.1:8000
 ---
 
 ## 🔄 Recovering from Saved Conversations
-For now it is a good idea to save the conversation to a txt file for later reference. The web ui is designed to allow this.
+Save the conversation with the "Save conversation" button in the web UI. To rebuild the facts from
+a saved `You: ... / AI: ...` transcript, use `/import conversation.txt`. It extracts one exchange
+at a time, so long transcripts are not cut off by the context window. `/load` restores the
+last facts saved in `resume_vault.db`.
 
 ---
 
 ## 📊 Future Improvements
 
-* [ ] Add project schema (structured portfolio section)
-* [ ] Resume tailoring for specific job descriptions
+* [x] Add project schema (structured portfolio section)
+* [x] Resume tailoring for specific job descriptions
 * [ ] DuckDB query interface (filter by skills, roles, etc.)
 * [ ] Persistent LangGraph checkpointing in database
 * [ ] Multi-resume support (resume_id)
